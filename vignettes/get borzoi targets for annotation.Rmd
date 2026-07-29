@@ -1,0 +1,46 @@
+---
+title: "get borzoi targets for annotation"
+author: "Michael Callahan"
+date: "2025-04-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load all targets
+```{r}
+setwd("/path/to/project/Other data/Borzoi targets")
+
+library(data.table)
+
+targets <- fread(
+  "targets_human.txt",   # path to the file
+  sep   = "\t",          # tab delimiter (the default, but explicit is clear)
+  header = TRUE,         # first line is column names
+  quote  = ""            # there are no quoted fields to strip
+)
+```
+
+## Filter by code words
+```{r}
+lung_rna <- targets[
+  grepl("rna",  description, ignore.case = TRUE) &
+  grepl("lung", description, ignore.case = TRUE)
+]
+setnames(lung_rna, 1, "")     # rename column 1 (“identifier”) to ""
+```
+
+## Write to txt
+```{r}
+# ‘lung_rna’ is the filtered data.table from the previous step
+fwrite(
+  lung_rna,
+  file      = "targets_human_lung_rna.txt",  # or use the original name to overwrite
+  sep       = "\t",      # tab-delimited, like the source file
+  col.names = TRUE,      # keep the header row
+  quote     = FALSE      # don’t add quotation marks
+)
+
+```

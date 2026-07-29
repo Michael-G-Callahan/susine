@@ -1,0 +1,88 @@
+---
+title: "CBX8 eQTL study"
+author: "Michael Callahan"
+date: "2025-05-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Prepare preliminaries
+Data source for z scores:
+https://www.gtexportal.org/home/downloads/adult-gtex/qtl
+https://console.cloud.google.com/storage/browser/gtex-resources/GTEx_Analysis_v10_QTLs/GTEx_Analysis_v10_eQTL_all_associations
+GTEx_Analysis_v10_QTLs_GTEx_Analysis_v10_eQTL_all_associations_Lung.v10.allpairs.chr17.parquet
+
+Data source for annotations: Borzoi
+
+Data source for LD matrix R: 
+https://predictdb.org/post/2021/07/21/gtex-v8-models-on-eqtl-and-sqtl/
+gtex_v8_expression_mashr_snp_smultixcan_covariance.txt.gz
+
+```{r load}
+setwd("/path/to/project/susine/vignettes")
+library(dplyr)
+z_scores = read.csv("/path/to/project/susine/data/CBX8 Study/GTEx v10 CBX8 Lung SNP z_scores.csv")
+annots = read.csv("/path/to/project/susine/data/CBX8 Study/Annotations_CBX8_JOB_ID_37270265.csv")
+R_mat_file = "/path/to/project/Other data/Correlation matrix for CBX8/CBX8_lung_R.Rdata"
+
+load(R_mat_file)
+
+z_scores_final <- z_scores %>%
+  arrange(variant_id) %>%                                   # sort
+  left_join(annots %>% select(snp, mean_logSED),           # pick only what we need
+            by = c("variant_id" = "snp"))                  # map mean_logSED
+
+# inspect
+head(z_scores_final)
+
+# count NAs in mean_logSED
+na_count <- sum(is.na(z_scores_final$mean_logSED))
+print(paste0("Unmatched annotations: ", nrow(z_scores_final) - na_count - nrow(annots)))
+
+# replace NAs with 0 (no tidyr)
+z_scores_final <- z_scores_final %>%
+  mutate(mean_logSED = ifelse(is.na(mean_logSED), 0, mean_logSED))
+
+z_scores = z_scores_final$z_score
+annots = z_scores_final$mean_logSED
+
+R = diag(1,nrow=length(z_scores))
+
+```
+
+
+```{r SuSiE}
+library(devtools)
+load_all()
+# undebug(susine_rss)
+susine_output1 <- susine_rss(
+    L=10,
+    z_scores,
+    R=ld_mat,
+    n=946,
+    prior_update_method = "var"
+    )
+
+z_scores_final$susie_PIP = susine_output1$model_fit$PIPs
+
+```
+
+```{r SuSiNE}
+library(devtools)
+load_all()
+# debug(susine_rss)
+susine_output2 <- susine_rss(
+    L=10,
+    z_scores,
+    R=ld_mat,
+    n=946,
+    mu_0=annots,
+    prior_update_method = "scale"
+    )
+
+z_scores_final$susine_PIP = susine_output2$model_fit$PIPs
+
+```

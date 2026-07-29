@@ -1,0 +1,668 @@
+---
+title: "SuSiNE Tutorial: Priors, Scaling, and Compute Knobs"
+date: 2025-10-13
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Overview
+
+This tutorial walks through SuSiNE use cases with increasing amounts of prior information and optional autoscaling. It also shows "no‑prior" settings where you can trade extra compute for potentially better fits (annealing, multiple initializations).
+
+```{r}
+library(devtools)
+load_all()
+
+# utils::data("SuSiE_N3_X", package = "susine")
+data("N3finemapping") # from susieR, under data/N3finemapping.rData
+attach(N3finemapping)
+
+library(susieR)
+```
+
+```{r}
+# Simulation setup (one small region)
+set.seed(1)
+n = nrow(X)
+p = ncol(X)
+causal_idx = sample(seq_len(p), 5)
+cat("Causal SNP indices:", paste(causal_idx, collapse=", "),"\n")
+
+# Randomly generate effect sizes for these SNPs
+b = rep(0, p)
+b[causal_idx] = rnorm(n = 5, mean = 0, sd = 1)
+cat("Causal effect sizes:", paste(round(b[causal_idx],2), collapse = ", "),"\n")
+
+# Generate phenotype with target noise fraction
+y_noise = 0.50
+sigma_2 = var(X %*% b) * (y_noise / (1 - y_noise))
+y = X %*% b + rnorm(n, mean = 0, sd = sqrt(sigma_2))
+
+cat("Marginal effects at causals:", paste(round((as.vector(cov(X, y)) / diag(var(X)))[causal_idx],2), collapse = ", "),"\n")
+invisible(cor(X[, causal_idx])) # show LD among causals
+```
+
+```{r}
+# Create a vector of SNP annotations (prior means)
+mu_0 = rnorm(n=p, mean = 0, sd = 0.1)
+mu_0[causal_idx] = mu_0[causal_idx] + b[causal_idx] # make prior means close to true effects for causals
+
+#boost the variance of the non-causals to match the causal
+# mu_0[-causal_idx] = mu_0[-causal_idx]*(sd(mu_0[causal_idx])/sd(mu_0[-causal_idx]))
+
+cat("Causal SNP annotations:", paste(round(mu_0[causal_idx],2), collapse = ", "),"\n")
+
+#Show the variance of the annotations for causal SNPs
+cat("Variance of causal SNP annotations:", round(var(mu_0[causal_idx]),4), "\n")
+
+#Show the variance of the annotations for non-causal SNPs
+cat("Variance of non-causal SNP annotations:", round(var(mu_0[-causal_idx]),4), "\n")
+
+
+#Show the R^2 of the annotations for causal SNPs (annotation quality)
+if (length(causal_idx) > 1 && sd(b[causal_idx]) > 0 && sd(mu_0[causal_idx]) > 0) {
+  observed_r2 <- cor(mu_0[causal_idx], b[causal_idx])^2
+} else {
+  observed_r2 <- NA
+}
+cat("Annotation R^2 for causal SNPs:", round(observed_r2, 4), "\n")
+
+
+# Create a vector of SNP annotations (prior variances)
+sigma_0_2 = mu_0^2 # simple magnitude-only variance proxy
+```
+
+```{r}
+# Metrics and helpers
+if (!requireNamespace("PRROC", quietly = TRUE)) install.packages("PRROC")
+library(PRROC)
+
+truth <- integer(p); truth[causal_idx] <- 1L
+
+pr_auc_vec <- function(scores, truth01) {
+  pr <- PRROC::pr.curve(scores.class0 = scores[truth01 == 1], scores.class1 = scores[truth01 == 0], curve = FALSE)
+  pr$auc.davis.goadrich
+}
+
+cross_entropy <- function(pip, truth01) {
+  eps <- .Machine$double.eps
+  pip <- pmin(pmax(pip, eps), 1 - eps)
+  -mean(truth01 * log(pip) + (1 - truth01) * log(1 - pip))
+}
+
+h2_true <- var(as.vector(X %*% b)) / var(y)
+cat(sprintf("True SNP Heritability (h_g^2): %.3f\n", h2_true))
+
+h2_pred_from_fit <- function(fit) {
+  s2 <- tail(fit$model_fit$sigma_2, 1)
+  1 - s2 / var(y)
+}
+
+report_metrics <- function(fit, label) {
+  pips <- fit$model_fit$PIPs
+  cat(sprintf("[%s] ELBO: %.3f  Pred h2: %.3f  PR-AUC: %.3f  CE: %.3f\n",
+              label,
+              tail(fit$model_fit$elbo, 1),
+              h2_pred_from_fit(fit),
+              pr_auc_vec(pips, truth),
+              cross_entropy(pips, truth)))
+}
+
+top_pips_table <- function(fit, k=10){
+  pips = fit$model_fit$PIPs
+  ord = order(pips, decreasing = TRUE)
+  idx = head(ord, k)
+  data.frame(SNP_Index = idx,
+             PIP = round(pips[idx],2),
+             True_Selection = as.integer(idx %in% causal_idx))
+}
+```
+
+---
+# Part A: No User Priors
+Start with no prior information and explore options from naive to EB. Then add compute-heavy knobs (annealing, multiple inits).
+
+```{r}
+### a.i. SuSiE — Naive mu, naive sigma (no EB)
+cat("--- Running: a.i (naive mu/sigma) ---\n")
+# undebug(susine)
+fit_a_i <- susine(L=5, X, y, prior_update_method = "none")
+report_metrics(fit_a_i, "a.i naive mu/sigma")
+test <- susie(X, y, L=5, estimate_prior_variance = FALSE)
+
+# Largest PIP difference vs susieR
+pip_diffs  = test$pip - fit_a_i$model_fit$PIPs
+max_diff_idx = which(pip_diffs == max(pip_diffs))
+paste("SNP with largest PIP difference:", max_diff_idx)
+paste("SuSiE value:", round(test$pip[max_diff_idx],4))
+paste("SuSiNE value:",  round(fit_a_i$model_fit$PIPs[max_diff_idx],4))
+paste("Difference:", round(pip_diffs[max_diff_idx],4))
+```
+
+```{r}
+### a.ii. SuSiE — EB sigma, naive mu
+cat("\n--- Running: a.ii (EB sigma) ---\n")
+fit_a_ii <- susine(L=5, X, y, prior_update_method = "var")
+report_metrics(fit_a_ii, "a.ii EB sigma, naive mu")
+
+test <- susie(X, y, L=5, estimate_prior_variance = TRUE)
+pip_diffs  = test$pip - fit_a_ii$model_fit$PIPs
+max_diff_idx = which(abs(pip_diffs) == max(abs(pip_diffs)))
+paste("SNP with largest PIP difference:", max_diff_idx)
+paste("SuSiE value:", round(test$pip[max_diff_idx],4))
+paste("SuSiNE value:",  round(fit_a_ii$model_fit$PIPs[max_diff_idx],4))
+paste("Difference:", round(pip_diffs[max_diff_idx],4))
+max(abs(pip_diffs))
+```
+
+```{r}
+### a.iii. SuSiNE — EB mu, naive sigma
+cat("\n--- Running: a.iii (EB mu) ---\n")
+fit_a_iii <- susine(L=5, X, y, prior_update_method = "mean")
+report_metrics(fit_a_iii, "a.iii EB mu, naive sigma")
+```
+
+```{r}
+### a.iv. SuSiNE — EB mu and EB sigma
+cat("\n--- Running: a.iv (EB mu & EB sigma) ---\n")
+fit_a_iv <- susine(L=5, X, y, prior_update_method = "both")
+report_metrics(fit_a_iv, "a.iv EB mu & EB sigma")
+```
+
+```{r}
+### a.v. No priors + annealing
+# Slows updates early to reduce greedy moves; potentially better ELBO
+fit_a_v <- susine(L=5, X, y,
+                  prior_update_method = "var",
+                  anneal_start_T = 100,
+                  anneal_schedule_type = "geometric",
+                  anneal_target = "both",
+                  anneal_burn_in = 30)
+report_metrics(fit_a_v, "a.v naive + annealing")
+```
+
+```{r}
+### a.vi. No priors + multiple random inits (ensemble and best-ELBO)
+
+L_susine <- 5
+
+## Calibrate init_random_sd analytically so the aggregate start explains ~5% of Var(y)
+target_var_frac <- 0.1           # target aggregate signal variance as fraction of Var(y)
+X_for_init <- initialize_X(X)     # reuse SuSiNE's standardization to access attr(X,"d")
+sum_d <- sum(attr(X_for_init, "d"))
+total_target_var <- target_var_frac * var(y)
+per_effect_target_var <- total_target_var / L_susine
+sd_cal <- sqrt(per_effect_target_var * (n - 1) / sum_d)
+
+cat(sprintf("Calibrated per-effect init_random_sd: %.4g (aggregate target %.1f%% of Var(y))\n",
+            sd_cal, 100 * target_var_frac))
+
+set.seed(1)
+multi_init_runs <- lapply(1:10, function(seed){
+  susine(L=L_susine, X, y,
+         prior_update_method = "none",
+         init_random = TRUE,
+         init_random_sd = sd_cal,
+         init_seed = seed)
+})
+
+# Aggregate PIPs across runs (equal and ELBO-weighted)
+agg_equal <- aggregate_susine_fits(multi_init_runs, weighting = "equal")
+agg_elbo  <- aggregate_susine_fits(multi_init_runs, weighting = "elbo", temperature = 1)
+
+# Best single run by ELBO for comparison
+elbos <- vapply(multi_init_runs, function(f) tail(f$model_fit$elbo,1), numeric(1))
+best_idx <- which.max(elbos)
+fit_a_vi_best <- multi_init_runs[[best_idx]]
+
+report_metrics(fit_a_vi_best, sprintf("a.vi best of 10 inits (seed %d)", best_idx))
+report_metrics(agg_equal, "a.vi ensemble (equal)")
+report_metrics(agg_elbo,  "a.vi ensemble (ELBO-weighted)")
+```
+
+---
+# Part B: User Priors (Unscaled)
+Provide informative priors without autoscaling.
+
+```{r}
+### b.i. SuSiE — functional sigma (mu=0)
+cat("\n--- Running: b.i (functional sigma; fixed) ---\n")
+functional_sigma <- mu_0^2 / var(y) # proportion of Var(y)
+fit_b_i <- susine(L=5, X, y, mu_0 = 0,
+                  sigma_0_2 = functional_sigma,
+                  prior_update_method = "none",
+                  auto_scale_mu_0 = FALSE,
+                  auto_scale_sigma_0_2 = FALSE)
+report_metrics(fit_b_i, "b.i mu=0, functional sigma (no autoscale)")
+```
+
+```{r}
+### b.ii. SuSiNE — functional mu, EB sigma
+cat("\n--- Running: b.ii (functional mu; EB sigma) ---\n")
+fit_b_ii <- susine(L=5, X, y,
+                   mu_0 = mu_0,
+                   prior_update_method = "var",
+                   auto_scale_mu_0 = FALSE,
+                   auto_scale_sigma_0_2 = FALSE)
+report_metrics(fit_b_ii, "b.ii functional mu (no autoscale), EB sigma")
+```
+
+```{r}
+### b.iii. SuSiNE — functional mu and functional sigma (fixed)
+cat("\n--- Running: b.iii (functional mu & sigma; fixed) ---\n")
+
+# Demonstration: fix sigma_0_2 via ground truth calibration (scalar)
+sigma0_sq_hat <- mean((b[causal_idx] - mu_0[causal_idx])^2)
+sigma0_prop_hat <- as.numeric(sigma0_sq_hat / var(y))
+
+fit_b_iii <- susine(L=5, X, y,
+                    mu_0 = mu_0,
+                    sigma_0_2 = rep(sigma0_prop_hat, p),
+                    prior_update_method = "none",
+                    auto_scale_mu_0 = FALSE,
+                    auto_scale_sigma_0_2 = FALSE)
+report_metrics(fit_b_iii, "b.iii functional mu & sigma (no autoscale)")
+```
+
+---
+# Part C: User Priors with Autoscaling
+Autoscaling helps when priors are directionally/magnitude‑informative but mis‑scaled overall.
+
+```{r}
+### c.i. Functional sigma + autoscale variance
+fit_c_i <- susine(L=5, X, y, mu_0 = 0,
+                  sigma_0_2 = functional_sigma,
+                  prior_update_method = "none",
+                  auto_scale_mu_0 = FALSE,
+                  auto_scale_sigma_0_2 = TRUE)
+report_metrics(fit_c_i, "c.i mu=0, functional sigma + autoscale sigma")
+```
+
+```{r}
+### c.ii. Functional mu + autoscale mean (variance EB)
+fit_c_ii <- susine(L=5, X, y,
+                   mu_0 = mu_0,
+                   prior_update_method = "var",
+                   auto_scale_mu_0 = TRUE,
+                   auto_scale_sigma_0_2 = FALSE)
+report_metrics(fit_c_ii, "c.ii functional mu + autoscale mu; EB sigma")
+
+#print the fitted mu scale
+fit_c_ii$priors$mu_0_scale_factor
+```
+
+```{r}
+### c.iii. Functional mu & sigma + autoscale both
+fit_c_iii <- susine(L=5, X, y,
+                    mu_0 = mu_0,
+                    sigma_0_2 = functional_sigma,
+                    prior_update_method = "none",
+                    auto_scale_mu_0 = TRUE,
+                    auto_scale_sigma_0_2 = TRUE)
+report_metrics(fit_c_iii, "c.iii functional mu & sigma + autoscale both")
+```
+
+```{r}
+# Optional: show top PIPs for a few cases
+cat("\nTop PIPs: a.i (naive)\n"); top_pips_table(fit_a_i)
+cat("\nTop PIPs: b.i (functional sigma)\n"); top_pips_table(fit_b_i)
+cat("\nTop PIPs: c.i (functional sigma + autoscale)\n"); top_pips_table(fit_c_i)
+```
+
+
+```{r}
+# --- given ---
+# ρ-level credible set by cumulative PIP
+get_credible_set <- function(alpha, cutoff = 0.95) {
+  if (!is.numeric(alpha)) stop("alpha must be numeric (PIPs).")
+  if (!is.finite(cutoff) || cutoff <= 0 || cutoff >= 1) stop("cutoff must be in (0,1).")
+  a <- alpha
+  a[!is.finite(a)] <- 0
+  if (sum(a) <= 0) return(integer(0))  # nothing to select
+
+  # order by decreasing PIP; break ties by original index
+  o  <- order(-a, seq_along(a))
+  cs <- cumsum(a[o])
+  k  <- which(cs >= cutoff)[1]
+  if (is.na(k)) integer(0) else o[seq_len(k)]
+}
+
+# --- NEW: per-effect metrics using your purity/coverage definitions ---
+cs_metrics_one_effect <- function(alpha_vec, X, causal_idx, cutoff = 0.95) {
+  cs <- get_credible_set(alpha_vec, cutoff = cutoff)
+  sz <- length(cs)
+
+  # purity = min |r| among pairs in CS (size-1 -> 1.0; empty -> NA)
+  purity <- if (sz >= 2) {
+    C <- cor(X[, cs, drop = FALSE], use = "pairwise.complete.obs")
+    min(abs(C[upper.tri(C)]))
+  } else if (sz == 1) {
+    1.0
+  } else {
+    NA_real_
+  }
+
+  # coverage: does this CS contain at least one true causal SNP?
+  coverage <- as.integer(sz > 0 && any(cs %in% causal_idx))
+
+  list(indices = cs, size = sz, purity = purity, coverage = coverage)
+}
+
+# --- NEW: wrapper across all L effects in fit_c_ii ---
+summarize_model_cs <- function(fit, X, causal_idx, cutoff = 0.95) {
+  stopifnot(is.matrix(X))
+  L <- fit$settings$L
+  A <- fit$effect_fits$alpha   # expected: L x p
+
+  eff <- vector("list", L)
+  for (l in seq_len(L)) {
+    eff[[l]] <- cs_metrics_one_effect(A[l, ], X, causal_idx, cutoff = cutoff)
+  }
+
+  effects_df <- data.frame(
+    effect   = seq_len(L),
+    size     = sapply(eff, `[[`, "size"),
+    purity   = sapply(eff, `[[`, "purity"),
+    coverage = sapply(eff, `[[`, "coverage"),
+    indices  = I(lapply(eff, `[[`, "indices"))
+  )
+
+  # union across effects for power
+  cs_union <- sort(unique(unlist(effects_df$indices)))
+  power <- if (length(causal_idx) > 0) {
+    length(intersect(cs_union, causal_idx)) / length(causal_idx)
+  } else NA_real_
+
+  model_summary <- data.frame(
+    L             = L,
+    mean_size     = mean(effects_df$size, na.rm = TRUE),
+    mean_purity   = mean(effects_df$purity, na.rm = TRUE),
+    mean_coverage = mean(effects_df$coverage, na.rm = TRUE),
+    power         = power
+  )
+
+  list(effects = effects_df, model = model_summary, cs_union_indices = cs_union)
+}
+
+# --- example usage (replaces your single-effect snippet) ---
+res <- summarize_model_cs(
+  fit = fit_c_ii,
+  X = X,                       # n x p
+  causal_idx = causal_idx,     # integer indices of true causal SNPs
+  cutoff = 0.95
+)
+
+res$effects      # per-effect table (indices is a list-column)
+res$model        # model-level aggregates (means + power)
+res$cs_union_indices
+
+```
+
+## Oracle ELBO Diagnostic
+
+```{r}
+# Force the single-effect updates to stay on the true causal SNPs and record the ELBO path
+oracle_idx <- rep(causal_idx, length.out = fit_a_i$settings$L)
+
+run_oracle_ibss <- function(fit_ref, X, y, idx_vec, n_iter = 10, sigma2_init = NULL) {
+  L_ref <- fit_ref$settings$L
+  idx_vec <- rep(idx_vec, length.out = L_ref)
+  stopifnot(all(idx_vec >= 1L), all(idx_vec <= ncol(X)))
+  prior_eps <- sqrt(.Machine$double.eps)
+  diag_mode <- TRUE
+
+  # Standardize inputs using the same utilities as the main fit
+  y_cent <- y - mean(y)
+  X_std <- initialize_X(X)
+  n <- nrow(X_std)
+  p <- ncol(X_std)
+  L <- L_ref
+
+  # Extract per-effect prior parameters so we can reuse the same scales
+  mu_mat <- fit_ref$priors$mu_0
+  sigma_mat <- fit_ref$priors$sigma_0_2/100
+  prior_mat <- fit_ref$priors$prior_inclusion_weights
+
+  sigma2_trace <- numeric(n_iter + 1)
+  sigma2_seed <- tail(fit_ref$model_fit$sigma_2[is.finite(fit_ref$model_fit$sigma_2)], 1)
+  if (length(sigma2_seed) == 0 || !is.finite(sigma2_seed)) {
+    sigma2_seed <- var(y_cent)
+  }
+  sigma2_trace[1] <- if (!is.null(sigma2_init)) sigma2_init else sigma2_seed
+  sigma2_lb <- if (!is.null(fit_ref$settings$residual_variance_lowerbound)) {
+    fit_ref$settings$residual_variance_lowerbound
+  } else {
+    var(y_cent) / 1e4
+  }
+
+  effect_b_hat <- matrix(0, nrow = L, ncol = p)
+  effect_b2_hat <- matrix(0, nrow = L, ncol = p)
+  KL_vec <- rep(0, L)
+  elbo_trace <- numeric(n_iter + 1)
+  elbo_trace[1] <- get_objective(X_std, y_cent, effect_b_hat, effect_b2_hat, sigma2_trace[1], KL_vec)
+
+  for (iter in seq_len(n_iter)) {
+    sigma2_current <- sigma2_trace[iter]
+    if (diag_mode && !is.finite(sigma2_current)) {
+      cat(sprintf("diag: sigma2_current NA at iter %d\n", iter))
+    }
+    full_residuals <- y_cent - compute_Xb(X_std, colSums(effect_b_hat))
+    if (diag_mode && any(!is.finite(full_residuals))) {
+      cat(sprintf("diag: full_residuals has NA at iter %d (first NA index: %s)\n",
+                  iter,
+                  paste(which(!is.finite(full_residuals))[1], collapse = ",")))
+    }
+
+    for (l in seq_len(L)) {
+      partial_residuals <- full_residuals + compute_Xb(X_std, effect_b_hat[l, ])
+      j <- idx_vec[l]
+      if (diag_mode && any(!is.finite(partial_residuals))) {
+        cat(sprintf("diag: partial_residuals NA at iter %d, effect %d\n", iter, l))
+      }
+
+      l_idx <- min(l, nrow(mu_mat))
+      mu_vec <- mu_mat[l_idx, ]
+      sigma_vec <- sigma_mat[l_idx, ]
+      prior_vec <- prior_mat[l_idx, ]
+
+      xty_full <- compute_Xty(X_std, partial_residuals)
+      d_j <- attr(X_std, "d")[j]
+      xty_j <- xty_full[j]
+      if (diag_mode && !is.finite(xty_j)) {
+        cat(sprintf("diag: xty_j NA at iter %d, effect %d, SNP %d\n", iter, l, j))
+      }
+      if (diag_mode && !is.finite(d_j)) {
+        cat(sprintf("diag: d_j NA at iter %d, effect %d, SNP %d\n", iter, l, j))
+      }
+
+      denom <- sigma2_current + sigma_vec[j] * d_j
+      if (diag_mode && (!is.finite(denom) || denom == 0)) {
+        cat(sprintf("diag: denom issue (%.3g) at iter %d, effect %d, SNP %d (sigma2=%.3g, sigma_vec=%.3g, d_j=%.3g)\n",
+                    denom, iter, l, j, sigma2_current, sigma_vec[j], d_j))
+      }
+      if (diag_mode && (!is.finite(sigma_vec[j]) || sigma_vec[j] < 0)) {
+        cat(sprintf("diag: sigma_vec problem at iter %d, effect %d, SNP %d (sigma_vec=%.3g)\n",
+                    iter, l, j, sigma_vec[j]))
+      }
+      mu1_j <- (sigma2_current * mu_vec[j] + sigma_vec[j] * xty_j) / denom
+      sigma1_j <- (sigma2_current * sigma_vec[j]) / denom
+      if (diag_mode && (!is.finite(mu1_j) || !is.finite(sigma1_j))) {
+        cat(sprintf("diag: posterior moment NA at iter %d, effect %d, SNP %d (mu1=%.3g, sigma1=%.3g)\n",
+                    iter, l, j, mu1_j, sigma1_j))
+      }
+
+      effect_b_hat[l, ] <- 0
+      effect_b_hat[l, j] <- mu1_j
+      effect_b2_hat[l, ] <- 0
+      effect_b2_hat[l, j] <- sigma1_j + mu1_j^2
+
+      log_BF_vec <- BF(X_std, partial_residuals, sigma2_current, sigma_vec, mu_vec)
+      log_prior_j <- log(prior_vec[j] + prior_eps)
+      lpo_j <- log_BF_vec[j] + log_prior_j
+      if (diag_mode && (!is.finite(log_BF_vec[j]) || !is.finite(lpo_j))) {
+        cat(sprintf("diag: log terms NA at iter %d, effect %d, SNP %d (logBF=%.3g, log_prior=%.3g)\n",
+                    iter, l, j, log_BF_vec[j], log_prior_j))
+      }
+
+      ser_erss <- SER_ERSS(X_std, partial_residuals, effect_b_hat[l, ], effect_b2_hat[l, ])
+      base_loglik <- sum(dnorm(partial_residuals, 0, sqrt(sigma2_current), log = TRUE))
+      KL_vec[l] <- - (lpo_j + base_loglik) -
+        ((n / 2) * log(2 * pi * sigma2_current) + (1 / (2 * sigma2_current)) * ser_erss)
+      if (diag_mode && !is.finite(KL_vec[l])) {
+        cat(sprintf("diag: KL NA at iter %d, effect %d (base_loglik=%.3g, lpo_j=%.3g, ser_erss=%.3g)\n",
+                    iter, l, base_loglik, lpo_j, ser_erss))
+      }
+
+      full_residuals <- partial_residuals - compute_Xb(X_std, effect_b_hat[l, ])
+    }
+
+    elbo_trace[iter + 1] <- get_objective(X_std, y_cent, effect_b_hat, effect_b2_hat, sigma2_current, KL_vec)
+    sigma2_candidate <- ERSS(X_std, y_cent, effect_b_hat, effect_b2_hat) / n
+    if (diag_mode && !is.finite(elbo_trace[iter + 1])) {
+      cat(sprintf("diag: ELBO NA at iter %d\n", iter))
+    }
+    if (diag_mode && !is.finite(sigma2_candidate)) {
+      cat(sprintf("diag: sigma2_candidate NA at iter %d\n", iter))
+    }
+    sigma2_trace[iter + 1] <- max(sigma2_candidate, sigma2_lb)
+    if (diag_mode && !is.finite(sigma2_trace[iter + 1])) {
+      cat(sprintf("diag: sigma2_trace NA after update at iter %d (candidate=%.3g, lower=%.3g)\n",
+                  iter, sigma2_candidate, sigma2_lb))
+    }
+  }
+
+  list(
+    idx = idx_vec,
+    elbo = elbo_trace,
+    sigma2 = sigma2_trace,
+    b_hat = effect_b_hat,
+    b_2_hat = effect_b2_hat,
+    KL = KL_vec,
+    X_std = X_std,
+    y_cent = y_cent
+  )
+}
+
+oracle_run <- run_oracle_ibss(
+  fit_ref = fit_a_i,
+  X = X,
+  y = y,
+  idx_vec = oracle_idx,
+  n_iter = 10,
+  sigma2_init = sigma_2
+)
+
+oracle_elbo <- tail(oracle_run$elbo, 1)
+oracle_elbo_sigma_updated <- get_objective(
+  oracle_run$X_std,
+  oracle_run$y_cent,
+  oracle_run$b_hat,
+  oracle_run$b_2_hat,
+  tail(oracle_run$sigma2, 1),
+  oracle_run$KL
+)
+fit_elbo <- tail(fit_a_i$model_fit$elbo[is.finite(fit_a_i$model_fit$elbo)], 1)
+
+cat(sprintf("Oracle ELBO (forced causal support, sigma2 used in sweep): %.3f\n", oracle_elbo))
+cat(sprintf("Oracle ELBO (after updating sigma2): %.3f\n", oracle_elbo_sigma_updated))
+cat(sprintf("fit_a_i ELBO: %.3f\n", fit_elbo))
+
+oracle_path <- data.frame(
+  iteration = seq_along(oracle_run$elbo) - 1,
+  sigma2 = oracle_run$sigma2,
+  elbo = oracle_run$elbo
+)
+
+oracle_erss <- ERSS(oracle_run$X_std, oracle_run$y_cent, oracle_run$b_hat, oracle_run$b_2_hat)
+
+list(
+  elbo_path = oracle_path,
+  oracle_erss = oracle_erss,
+  oracle_sigma2 = tail(oracle_run$sigma2, 1)
+)
+```
+
+## Truth-Initialized Trajectory
+
+```{r}
+truth_idx <- causal_idx
+
+L_truth <- fit_a_i$settings$L
+truth_idx_rep <- rep(truth_idx, length.out = L_truth)
+
+X_std_for_init <- initialize_X(X)
+scale_vec <- attr(X_std_for_init, "original:scale")
+scale_vec[scale_vec == 0] <- 1
+
+alpha_init <- matrix(0, nrow = L_truth, ncol = p)
+b_hat_init <- matrix(0, nrow = L_truth, ncol = p)
+for (l in seq_len(L_truth)) {
+  j <- truth_idx_rep[l]
+  alpha_init[l, j] <- 1
+  b_hat_init[l, j] <- b[j] * scale_vec[j]
+}
+
+y_centered_truth <- y - mean(y)
+resid_truth_std <- y_centered_truth - compute_Xb(X_std_for_init, colSums(b_hat_init))
+sigma2_init_truth <- var(resid_truth_std)
+cat(sprintf("sigma2 (nominal simulation): %.6f  |  sigma2 (standardized truth residuals): %.6f\n",
+            sigma_2, sigma2_init_truth))
+
+fit_truth <- susine(
+  L = L_truth,
+  X = X,
+  y = y,
+  prior_update_method = fit_a_i$settings$prior_update_method,
+  anneal_start_T = fit_a_i$settings$anneal_start_T,
+  anneal_schedule_type = fit_a_i$settings$anneal_schedule_type,
+  anneal_target = fit_a_i$settings$anneal_target,
+  anneal_burn_in = fit_a_i$settings$anneal_burn_in,
+  prior_update_warmup = fit_a_i$settings$prior_update_warmup,
+  init_alpha = alpha_init,
+  init_sigma2 = sigma2_init_truth,
+  record_history = TRUE
+)
+
+pip_history <- fit_truth$model_fit$pip_history
+elbo_vec <- fit_truth$model_fit$elbo
+sigma_vec <- fit_truth$model_fit$sigma_2
+
+metrics_truth <- data.frame(
+  iteration = seq_along(elbo_vec) - 1,
+  elbo = elbo_vec,
+  sigma2 = sigma_vec,
+  auprc = vapply(pip_history, function(pip) pr_auc_vec(pip, truth), numeric(1)),
+  cross_entropy = vapply(pip_history, function(pip) cross_entropy(pip, truth), numeric(1))
+)
+
+metrics_truth
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(metrics_truth, aes(x = elbo, y = auprc)) +
+  geom_path(color = "grey70") +
+  geom_point(size = 2.2) +
+  geom_text(aes(label = iteration), vjust = -0.8, size = 3.5) +
+  labs(
+    title = "AUPRC trajectory from truth-initialized IBSS",
+    x = "ELBO",
+    y = "PR-AUC (PIPs vs truth)"
+  )
+```
+
+```{r}
+ggplot(metrics_truth, aes(x = elbo, y = cross_entropy)) +
+  geom_path(color = "grey70") +
+  geom_point(size = 2.2) +
+  geom_text(aes(label = iteration), vjust = -0.8, size = 3.5) +
+  labs(
+    title = "Cross-Entropy trajectory from truth-initialized IBSS",
+    x = "ELBO",
+    y = "Cross-Entropy (PIPs vs truth)"
+  )
+```

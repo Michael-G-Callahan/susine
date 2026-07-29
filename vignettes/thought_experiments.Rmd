@@ -1,0 +1,210 @@
+---
+title: "Thought experiments"
+author: "Michael Callahan"
+date: "2024-06-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Finding the advantage of SuSiNE priors
+SuSiE currently assumes the following spike and slab prior.
+
+
+```{r current priors}
+# Load necessary library
+library(ggplot2)
+
+# Set parameters
+alpha <- 0.3 # Weight for the spike at zero
+n <- 10000    # Number of samples
+mean0 <- 0    # Mean for the normal distribution
+mean1 <- 3    # Mean for the normal distribution
+sd <- 1      # Standard deviation for the normal distribution
+
+# Simulate spike data
+spike_data <- rep(0, round(n * alpha))
+
+# Simulate slab data
+slab_data0 <- rnorm(n - length(spike_data), mean0, sd)
+slab_data1 <- rnorm(n - length(spike_data), mean1, sd)
+
+# Combine spike and slab data
+spike_slab_data0 <- c(spike_data, slab_data0)
+spike_slab_data1 <- c(spike_data, slab_data1)
+
+# Convert to data frame for plotting
+data <- data.frame(value = spike_slab_data0)
+
+# Plot the spike and slab distribution
+ggplot(data, aes(x = value)) +
+  geom_histogram(aes(y = ..density..), bins = 50, fill = "skyblue", color = "black", alpha = 0.7) +
+  stat_function(fun = dnorm, args = list(mean = mean, sd = sd), color = "red", size = 1) +
+  ggtitle("Spike and Slab Distribution: PDF") +
+  xlab("Value") +
+  ylab("Density") +
+  theme_minimal()
+
+# Compute the empirical CDF
+ecdf_data0 <- ecdf(spike_slab_data0)
+ecdf_data1 <- ecdf(spike_slab_data1)
+
+# Plot the CDF
+ggplot(cdf_data, aes(x = x, y = y)) +
+  geom_step(color = "blue", size = 1) +
+  ggtitle("CDF of the Spike and Slab Distribution") +
+  xlab("Value") +
+  ylab("Cumulative Probability") +
+  theme_minimal()
+
+# Determine the range for plotting
+x_range <- sort(unique(c(spike_slab_data0, spike_slab_data1)))
+
+# Compute the CDF values over the range
+cdf1_values <- ecdf_data0(x_range)
+cdf2_values <- ecdf_data1(x_range)
+
+# Compute the difference between the two CDFs
+cdf_difference <- cdf1_values - cdf2_values
+
+# Create a data frame for plotting
+cdf_diff_data <- data.frame(x = x_range, difference = cdf_difference)
+
+# Plot the difference between the two CDFs
+ggplot(cdf_diff_data, aes(x = x, y = difference)) +
+  geom_line(color = "blue", size = 1) +
+  ggtitle("Difference Between Two CDFs") +
+  xlab("Value") +
+  ylab("Difference in Cumulative Probability") +
+  theme_minimal()
+
+```
+
+```{r likelihood playing}
+
+lik1 = dnorm(1, mean = 0, sd = 1, log = TRUE)
+lik2 = dnorm(2, mean = 0, sd = 1, log = TRUE)
+
+lik1 - lik2
+
+lik1 = dnorm(1, mean = -1, sd = 1, log = TRUE)
+lik2 = dnorm(2, mean = -1, sd = 1, log = TRUE)
+
+lik1 - lik2
+
+lik1 = dnorm(1, mean = -10, sd = 1, log = TRUE)
+lik2 = dnorm(2, mean = -10, sd = 1, log = TRUE)
+
+lik1 - lik2
+
+### EB -- SuSiNE
+lik1 = dnorm(10, mean = 10, sd = .3, log = TRUE)
+lik2 = dnorm(12, mean = 10, sd = .3, log = TRUE)
+
+lik1 - lik2
+
+### EB -- SuSiNE
+lik1 = dnorm(10, mean = 10, sd = .3, log = TRUE)
+lik2 = dnorm(-12, mean = 10, sd = .3, log = TRUE)
+
+lik1 - lik2
+
+### EB -- SuSiE
+lik1 = dnorm(10, mean = 0, sd = 1, log = TRUE)
+lik2 = dnorm(-12, mean = 0, sd = 1, log = TRUE)
+
+lik1 - lik2
+```
+
+```{r likelihood playing}
+library(devtools)
+library(matrixStats)
+load_all()
+noise = 0.1
+n=574
+X = as.matrix(SuSiE_N3_X[1:n,1:1000])
+# X = rbind(X, X, X, X)
+X = standardize_X(X)
+# X[,which(is.na(X[1,]))] <- rnorm(n,0,1)
+intercept = TRUE
+standardize = TRUE
+out = compute_colstats(X,center = intercept,scale = standardize)
+attr(X,"scaled:center") = out$cm
+attr(X,"scaled:scale") = out$csd
+attr(X,"d") = out$d
+p = ncol(X)
+prior_inclusion_weights = rep(1/p, p)
+
+beta = rep(0, 1000)
+# beta[c(2,101,201)] = 5
+p_star = 3
+beta[sample(1000, p_star)] = rnorm(p_star,2,2)
+try_seed = 3
+y = simulate_y_noise(X, beta, noise, try_seed)
+y = y/var(drop(y)) 
+hist(y, breaks = 50)
+plot(log(diff(sort(y))))
+#var(beta_hat) / shat2 -- around 5
+
+sigma_0_2 = 1
+mu_0=0
+beta_hat = compute_Xty(X, y) / attr(X, "d")
+# beta_hat[beta_hat < -5] = -5
+# beta_hat = rnorm(10000, mean = 0, sd = .3) #fake
+# beta_hat[1:20] = seq(from = 1.95, to = 2.05, by = 0.005) #fake
+sigma_2 = var(drop(y))*noise
+shat2 = sigma_2 / attr(X, "d")
+# shat2 = .1
+
+top_coef_idx = order(abs(beta_hat), decreasing = TRUE)[1:10]
+top_entries <- beta_hat[top_coef_idx]
+round(top_entries,3)
+
+hist(beta_hat, probability = TRUE, breaks = 50)
+# hist(beta_hat, probability = TRUE, breaks = 50, ylim = c(0,5), xlim =c(-1.1, 2.2))
+
+# Overlay the normal distribution PDF
+x <- seq(min(beta_hat), max(beta_hat), length = 1000)
+std_y <- dnorm(x, mean = 0, sd = sqrt(shat2[1]))
+lines(x, std_y, col = "red", lwd = 2)
+
+# Overlay fitted SuSiE prior
+susie_fit = update_priors(mu_0=0, sigma_0_2=sigma_0_2, X, y, sigma_2, prior_inclusion_weights, prior_update_params="var")
+susie_var = susie_fit$sigma_0_2
+susie_prior <- dnorm(x, mean = 0, sd = sqrt(susie_var))
+lines(x, susie_prior, col = "blue", lwd = 2)
+
+log_BF_SuSiE = as.vector(dnorm(beta_hat,mu_0,sqrt(susie_var + shat2),log = TRUE) -
+                       dnorm(beta_hat,0,sqrt(shat2),log = TRUE))
+round(log_BF_SuSiE[top_coef_idx],3)
+
+lpo = log_BF_SuSiE + log(prior_inclusion_weights + sqrt(.Machine$double.eps)) #log of posterior odds
+maxlpo = max(lpo)
+w_weighted = exp(lpo - maxlpo)
+weighted_sum_w = sum(w_weighted)
+susie_alpha = w_weighted / weighted_sum_w
+round(susie_alpha[top_coef_idx],3)
+
+# Overlay fitted SuSiNE prior
+susine_fit = update_priors(mu_0=0, sigma_0_2=sigma_0_2, X, y, sigma_2, prior_inclusion_weights, prior_update_params="both")
+susine_mu = susine_fit$mu_0
+# susine_mu = 2 #fake
+susine_var = susine_fit$sigma_0_2
+# susine_var = .00001 #fake
+susine_prior <- dnorm(x, mean = susine_mu, sd = sqrt(susine_var))
+lines(x, susine_prior, col = "purple", lwd = 2)
+susine_prior_adj <- dnorm(x, mean = susine_mu, sd = sqrt(susine_var + shat2))
+lines(x, susine_prior_adj, col = "purple", lwd = 2, lty = 2)
+
+log_BF_SuSiNE = as.vector(dnorm(beta_hat,susine_mu,sqrt(susine_var + shat2),log = TRUE) -
+                       dnorm(beta_hat,0,sqrt(shat2),log = TRUE))
+round(log_BF_SuSiNE[top_coef_idx],3)
+lpo = log_BF_SuSiNE + log(prior_inclusion_weights + sqrt(.Machine$double.eps)) #log of posterior odds
+maxlpo = max(lpo)
+w_weighted = exp(lpo - maxlpo)
+weighted_sum_w = sum(w_weighted)
+susine_alpha = w_weighted / weighted_sum_w
+round(susine_alpha[top_coef_idx],3)
+```

@@ -1,0 +1,185 @@
+---
+title: "get LD matrix for CBX8 study"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+ Try reading from the online pre-calc source
+
+```{r}
+library(data.table)
+
+ld_file <- "/path/to/project/Other data/Correlation matrix for CBX8/gtex_v8_expression_mashr_snp_covariance.txt"
+
+## ---------- 1. Verify awk availability ----------
+have_awk <- nzchar(Sys.which("awk"))
+
+## ---------- 2. Build the reader ----------
+if (have_awk) {
+  ## Windows needs the file path in *double* quotes; awk script in *single* quotes
+  awk_cmd <- sprintf(
+    "awk \"($2 ~ /^chr17_/ || $3 ~ /^chr17_/ )\" \"%s\"",
+    ld_file
+  )
+  
+  message("Reading via awk stream-filter …")
+  ld17 <- fread(
+    cmd         = awk_cmd,
+    sep         = " ",                     # space-delimited
+    header      = FALSE,
+    col.names   = c("GENE", "RSID1", "RSID2", "VALUE"),
+    colClasses  = c("character", "character", "character", "numeric"),
+    showProgress = FALSE
+  )
+  
+} else {
+  message("awk not found – falling back to in-R filtering (needs a bit more RAM).")
+  
+  ## read only the columns we need, then filter
+  ld <- fread(
+    ld_file,
+    sep        = " ",
+    select     = 2:4,                      # drop the GENE column up-front
+    col.names  = c("RSID1", "RSID2", "VALUE"),
+    colClasses = c("character", "character", "numeric"),
+    nThread    = 8                         # adjust to your CPU
+  )
+  ld17 <- ld[grepl("^chr17_", RSID1) | grepl("^chr17_", RSID2)]
+}
+
+## ---------- 3. Subset to your focal variants ----------
+z_scores <- fread("/path/to/project/susine/data/CBX8 Study/GTEx v10 CBX8 Lung SNP z_scores.csv")
+targets_chr17 <- z_scores$variant_id       # already chr17-only in your file
+
+ld_sub <- ld17[
+  RSID1 %in% targets_chr17 & RSID2 %in% targets_chr17
+]
+
+
+```
+
+```{r}
+# --- 1)  Your two data frames -----------------------------------------------
+# df_pairs    : the “long” table with RSID1, RSID2, VALUE   (first screenshot)
+# variants_df : the one-column table with variant_id        (second screenshot)
+
+# Example names (rename if yours differ):
+# df_pairs    <- your_first_dataframe
+# variants_df <- your_second_dataframe
+
+# --- 2)  Fix the variant order you want --------------------------------------
+var_order <- z_scores$variant_id        # keep the original order
+n         <- length(var_order)
+
+# --- 3)  If the pair table has multiple rows per pair (e.g. different genes),
+#         pick ONE value per pair – here I take the mean ----------------------
+library(dplyr)
+
+ld_pairs <- ld_sub                                      %>% 
+  filter(RSID1 %in% var_order & RSID2 %in% var_order)      %>%  # keep only needed SNPs
+  group_by(RSID1, RSID2)                                   %>% 
+  summarise(VALUE = mean(VALUE, na.rm = TRUE), .groups="drop")
+
+# --- 4)  Build an empty square matrix and fill it ----------------------------
+ld_mat <- matrix(NA_real_, n, n,
+                 dimnames = list(var_order, var_order))
+diag(ld_mat) <- 1                                            # self-LD = 1
+
+# fill the upper & lower triangles
+for (i in seq_len(nrow(ld_pairs))) {
+  snp1 <- ld_pairs$RSID1[i]
+  snp2 <- ld_pairs$RSID2[i]
+  val  <- ld_pairs$VALUE[i]
+  
+  ld_mat[snp1, snp2] <- val
+  ld_mat[snp2, snp1] <- val      # symmetry
+}
+
+# --- 5)  (Optional) replace any still-missing cells --------------------------
+# For example, NA → 0 (or keep NA if you prefer):
+ld_mat[is.na(ld_mat)] <- 0
+
+save(ld_mat, file="CBX8_lung_R.Rdata")
+getwd()
+
+```
+
+
+
+
+```{r}
+# library(SNPRelate)
+# 
+# # 0) Convert VCF → GDS once (fast binary format)
+# setwd("/path/to/project/susine/vignettes")
+# variants_file = "/path/to/project/Other data/GTEx QTL Annotations/snps_CBX8_expr.vcf"
+# 
+# snpgdsVCF2GDS(variants_file, "variants.gds", method="biallelic.only")
+# 
+# genofile <- snpgdsOpen("variants.gds")
+# 
+# # 1) Choose SNPs to keep (here: all)
+# snp_ids <- read.gdsn(index.gdsn(genofile, "snp.id"))
+# 
+# # 2) LD matrix (Pearson r)
+# ld <- snpgdsLDMatrix(genofile,
+#                      snp.id = snp_ids,
+#                      method = "corr",   # "r" = correlation, "r2" for r²
+#                      slide = Inf)       # no window → full matrix
+# 
+# snpgdsClose(genofile)
+# saveRDS(ld$LD, file = "LD_matrix.rds")
+```
+
+Get RSIDs and then query from a database. -- doesnt really work bc of LDLink data limit (2500, we ahve 9116)
+
+```{r}
+
+
+# vcf_path <- "/path/to/project/Other data/GTEx QTL Annotations/snps_CBX8_expr.vcf" 
+# 
+# ## 0 – make sure the SNPlocs package is loaded *before* you call it
+# library(SNPlocs.Hsapiens.dbSNP155.GRCh38)
+# snps_db <- SNPlocs.Hsapiens.dbSNP155.GRCh38
+# 
+# library(GenomicRanges)
+# library(GenomeInfoDb)   # for seqlevelsStyle()
+# 
+# ## 1 – read the VCF body (7 columns, no INFO in your file)
+# library(data.table)
+# vcf <- fread(vcf_path, skip = 1, header = FALSE,
+#              col.names = c("CHROM","POS","ID","REF","ALT","QUAL","FILTER"))
+# 
+# ## 2 – build a GRanges for those sites
+# gr <- GRanges(seqnames = vcf$CHROM,
+#               ranges   = IRanges(vcf$POS, width = 1),
+#               REF = vcf$REF,
+#               ALT = vcf$ALT)
+# 
+# ## 3 – match chromosome naming styles
+# seqlevelsStyle(gr) <- seqlevelsStyle(snps_db)  # now they share “17”
+# 
+# ## 4 – overlap query (omit ‘columns=’ if your Bioconductor < 3.18)
+# hits <- snpsByOverlaps(snps_db, gr)            # returns GRanges
+# rsids <- mcols(hits)$RefSNP_id                 # extract rs IDs
+# 
+# ## check
+# table(is.na(rsids))
+# head(rsids, 10)
+
+```
+```{r}
+# library(bigsnpr)
+# obj <- snp_attach("ref_CBX8.rds")
+# LD  <- snp_cor(obj$genotypes, infos.chr = obj$map$chromosome,
+#                size = Inf) 
+```
+
+```{r}
+# library(bigsnpr)
+# obj <- snp_attach("ref_CBX8.rds")
+# LD  <- snp_cor(obj$genotypes, infos.chr = obj$map$chromosome,
+#                size = Inf) 
+```
+

@@ -1,0 +1,15 @@
+^susine\.Rproj$
+^\.Rproj\.user$
+^LICENSE\.md$
+^README\.Rmd$
+^data-raw$
+^refs$
+^vignettes$
+^\.lintr$
+^\.vscode$
+^\.github$
+^\.Rhistory$
+^release_prep$
+^.*\.Rproj$
+^tests/testthat/benchmark_prior_methods\.Rmd$
+^tests/testthat/mini_sim_prior_methods\.R$

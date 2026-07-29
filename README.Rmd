@@ -1,0 +1,94 @@
+---
+output: github_document
+---
+
+<!-- README.md is generated from README.Rmd. Please edit that file -->
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.path = "man/figures/README-",
+  out.width = "100%"
+)
+```
+
+# susine
+
+<!-- badges: start -->
+<!-- badges: end -->
+
+**susine** implements the Sum of Single Non-central Effects (SuSiNE) model, a
+Bayesian variable-selection / fine-mapping method that extends
+[SuSiE](https://github.com/stephenslab/susieR) by allowing nonzero, *signed*
+prior means on effect sizes: `mu_0 = c * a`, where `a` is an annotation-derived
+signed vector (e.g. from a sequence model) and `c` is a global scale. This lets
+external functional information nudge the posterior toward biologically
+plausible effects rather than only reweighting inclusion probabilities.
+
+The package provides model fitting from:
+
+- individual-level data — `susine()`,
+- sufficient statistics — `susine_ss()`,
+- summary statistics / RSS — `susine_rss()`,
+
+together with the single-effect regression building blocks, empirical-Bayes
+prior-update methods, and multi-start fit aggregation
+(`aggregate_susine_fits()`). Each fit returns posterior inclusion probabilities
+(PIPs), credible sets, and the evidence lower bound (ELBO).
+
+## Installation
+
+You can install the development version of susine from
+[GitHub](https://github.com/Michael-G-Callahan/susine) with:
+
+``` r
+# install.packages("devtools")
+devtools::install_github("Michael-G-Callahan/susine")
+```
+
+## Dependencies
+
+`susine` is **pure R** (no compiled code). The core model depends only on
+`Matrix` and `matrixStats`. In particular, **the core model does not require
+`susieR`** — that dependency is only relevant to the paper's *baseline
+comparisons*, which live in the companion `test-susine` repository. Those
+comparisons pin the upstream package `stephenslab/susieR` (tag `0.15.53`,
+commit `fbe5b7d`; the SuSiE-pathology exhibits use `0.15.51` / `34a4a52`) —
+this is unmodified upstream SuSiE, not a fork.
+
+## Example
+
+A minimal fine-mapping fit on simulated data:
+
+```{r example}
+library(susine)
+
+set.seed(1)
+n <- 500
+p <- 100
+
+# Design matrix and a sparse truth with two causal variables
+X <- matrix(rnorm(n * p), nrow = n, ncol = p)
+beta <- rep(0, p)
+beta[c(10, 60)] <- c(1.5, -1.2)
+y <- as.numeric(X %*% beta + rnorm(n))
+
+# Fit SuSiNE with up to L = 5 single effects (default zero prior means
+# recovers standard SuSiE-style behavior)
+fit <- susine(L = 5, X = X, y = y)
+
+# Posterior inclusion probabilities for the truly causal variables
+fit$model_fit$PIPs[c(10, 60)]
+```
+
+To supply directional prior information, pass a signed annotation vector via
+`mu_0` (and optionally let the global scale be fit with `auto_scale_mu_0 =
+TRUE`). See `?susine`, `?susine_ss`, and `?susine_rss` for details.
+
+## Reproducing the paper
+
+This repository is the **model engine only**. The simulations, ensemble/scaling
+analyses, sensitivity checks, and the real-data case study from the paper are
+run through the companion **`test-susine`** harness — see its `REPRODUCIBILITY`
+index for the paper-figure → method-trace → command map.

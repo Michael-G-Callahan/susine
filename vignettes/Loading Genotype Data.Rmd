@@ -1,0 +1,26 @@
+---
+title: "Loading Genotype Data"
+author: "Michael Callahan"
+date: "2025-02-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r load X data}
+setwd("/path/to/project/Other data/Simulated Genotypes/")
+file_name = "data_sub2_raw.raw"
+
+df <- read.table(file_name, header = TRUE)
+```
+
+
+```{r transform X data}
+df <- df[7:ncol(df)]
+colnames(df) <- paste0("v", seq_len(ncol(df)))
+save(df, file = 'X.Rdata')
+```

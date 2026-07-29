@@ -1,0 +1,162 @@
+---
+title: "Collate simulation results"
+author: "Michael Callahan"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{E2E testing}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+## Purpose:
+To read in and combine simulation results and then visualize them
+
+```{r, include = FALSE}
+library(knitr)
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup, echo=FALSE}
+library(ggplot2)
+library(dplyr)
+```
+
+```{r read in data}
+folder_path = '/path/to/project/test-susine/simulation results/'
+job_name = 'Job_ID_31580795'
+
+# Define a function to load an .Rdata file and return the data frame
+load_data <- function(file) {
+  load(file)
+  # Assuming the data frame has a consistent name in all files, e.g., "df"
+  return(results_df)
+}
+
+# List all .Rdata files in the directory
+files <- list.files(path = paste0(folder_path, job_name), pattern = "\\.Rdata$", full.names = TRUE)
+
+# Load all data frames into a list
+data_frames <- lapply(files, load_data)
+
+# Combine all data frames into one
+combined_df <- do.call(rbind, data_frames)
+
+rm(data_frames)
+```
+
+```{r get median}
+
+summary_df <- combined_df %>%
+  # filter(L == 5, p_star == 5, noise == '0.7') %>%
+  group_by(p_star, noise, L, gene_importance, annotation_abundance) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  mutate(inform_diff = pr_auc_inform - pr_auc_naive) %>%
+  mutate(prior_diff = pr_auc_both - pr_auc_var) %>%
+  arrange(desc(inform_diff))
+
+
+metric_columns <- colnames(summary_df)
+metric_columns <- metric_columns[grepl("^pr_auc_", metric_columns)]
+metric_summary_df <- summary_df[,c("p_star", "noise", "L", "gene_importance", "annotation_abundance", metric_columns)]
+
+# 
+# summary_df <- summary_df %>%
+# filter(L == 3, p_star == 3, noise == '0.7') 
+# summary_df$diff = summary_df$pr_auc_inform - summary_df$pr_auc_naive
+# summary_df[,c(1:5,24:30)]
+
+write.csv(metric_summary_df, file="sim_v_annotations_informed_3.csv")
+
+```
+
+```{r get exp ID of interest}
+combined_df = combined_df %>%
+  mutate(susine_diff = pr_auc_var - `pr_auc_inform-EB`) %>%
+  select(noise, p, L, seed, p_star, p_annots, beta_noise, pr_auc_var, pr_auc_both, pr_auc_inform, `pr_auc_inform-EB`, susine_diff)
+which.max(combined_df$susine_diff)
+combined_df[479,]
+```
+
+
+```{r plot results}
+library(gridExtra)
+library(ggplot2)
+L2_plot <- ggplot(summary_df, aes(p)) +
+  geom_point(aes(y = L2_var, color = "var")) +
+  geom_line(aes(y = L2_var, color = "var")) +
+  geom_point(aes(y = L2_mu_adj_75, color = "mu_adj_75")) +
+  geom_line(aes(y = L2_mu_adj_75, color = "mu_adj_75")) +
+  geom_point(aes(y = L2_both, color = "both")) +
+  geom_line(aes(y = L2_both, color = "both")) +
+  geom_point(aes(y = L2_naive, color = "naive")) +
+  geom_line(aes(y = L2_naive, color = "naive")) +
+  geom_point(aes(y = L2_inform, color = "inform")) +
+  geom_line(aes(y = L2_inform, color = "inform")) +
+  labs(x = "p (# X columns)", y = "Coefficient Explanation", color = "Method") +
+  ggtitle("Coefficient Error Comparison") +
+  theme_minimal()
+
+# print(L2_plot)
+
+r2_plot <- ggplot(summary_df, aes(p)) +
+  geom_point(aes(y = R2_var, color = "var")) +
+  geom_line(aes(y = R2_var, color = "var")) +
+  geom_point(aes(y = R2_mu_adj_75, color = "mu_adj_75")) +
+  geom_line(aes(y = R2_mu_adj_75, color = "mu_adj_75")) +
+  geom_point(aes(y = R2_both, color = "both")) +
+  geom_line(aes(y = R2_both, color = "both")) +
+  geom_point(aes(y = R2_naive, color = "naive")) +
+  geom_line(aes(y = R2_naive, color = "naive")) +
+  geom_point(aes(y = R2_inform, color = "inform")) +
+  geom_line(aes(y = R2_inform, color = "inform")) +
+  labs(x = "p (# X columns)", y = "Adjusted R^2", color = "Method") +
+  ggtitle("Adjusted R^2 Comparison") +
+  theme_minimal()
+
+# print(r2_plot)
+
+auc_plot <- ggplot(summary_df, aes(p)) +
+  geom_point(aes(y = auc_var, color = "var")) +
+  geom_line(aes(y = auc_var, color = "var")) +
+  geom_point(aes(y = auc_mu_adj_75, color = "mu_adj_75")) +
+  geom_line(aes(y = auc_mu_adj_75, color = "mu_adj_75")) +
+  geom_point(aes(y = auc_both, color = "both")) +
+  geom_line(aes(y = auc_both, color = "both")) +
+  geom_point(aes(y = auc_naive, color = "naive")) +
+  geom_line(aes(y = auc_naive, color = "naive")) +
+  geom_point(aes(y = auc_inform, color = "inform")) +
+  geom_line(aes(y = auc_inform, color = "inform")) +
+  geom_point(aes(y = auc_random, color = "random")) +
+  geom_line(aes(y = auc_random, color = "random")) +
+  labs(x = "p (# X columns)", y = "AUC", color = "Method") +
+  ggtitle("AUC Comparison") +
+  theme_minimal()
+
+# print(auc_plot)
+
+pr_auc_plot <- ggplot(summary_df, aes(p)) +
+  geom_point(aes(y = pr_auc_var, color = "var")) +
+  geom_line(aes(y = pr_auc_var, color = "var")) +
+  geom_point(aes(y = pr_auc_mu_adj_75, color = "mu_adj_75")) +
+  geom_line(aes(y = pr_auc_mu_adj_75, color = "mu_adj_75")) +
+  geom_point(aes(y = pr_auc_both, color = "both")) +
+  geom_line(aes(y = pr_auc_both, color = "both")) +
+  geom_point(aes(y = pr_auc_naive, color = "naive")) +
+  geom_line(aes(y = pr_auc_naive, color = "naive")) +
+  geom_point(aes(y = pr_auc_inform, color = "inform")) +
+  geom_line(aes(y = pr_auc_inform, color = "inform")) +
+  geom_point(aes(y = pr_auc_random, color = "random")) +
+  geom_line(aes(y = pr_auc_random, color = "random")) +
+  labs(x = "p (# X columns)", y = "PR AUC", color = "Method") +
+  ggtitle("PR AUC Comparison") +
+  theme_minimal()
+
+# print(pr_auc_plot)
+
+grid.arrange(L2_plot, r2_plot, auc_plot, pr_auc_plot, nrow = 2, ncol = 2)
+
+```
+

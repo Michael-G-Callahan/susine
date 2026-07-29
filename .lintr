@@ -1,0 +1,4 @@
+linters: with_defaults(
+  object_usage_linter = object_usage_linter(package = "susine"),
+  line_length_linter = NULL
+)

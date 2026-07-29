@@ -1,0 +1,21 @@
+{
+  "upload_type": "software",
+  "title": "susine: Sum of Single, Non-Central Effects (SuSiNE)",
+  "description": "R package implementing the SuSiNE model, a Bayesian variable-selection and fine-mapping method extending SuSiE with signed, annotation-derived prior means.",
+  "creators": [
+    {
+      "name": "Callahan, Michael G.",
+      "orcid": "0009-0007-6532-0995",
+      "affiliation": "Pennsylvania State University"
+    }
+  ],
+  "license": "MIT",
+  "access_right": "open",
+  "related_identifiers": [
+    {
+      "identifier": "10.5281/zenodo.21539486",
+      "relation": "isSupplementedBy",
+      "resource_type": "dataset"
+    }
+  ]
+}

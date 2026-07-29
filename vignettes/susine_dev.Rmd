@@ -1,0 +1,179 @@
+---
+title: "Development Testing Notebook"
+author: "Michael Callahan"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Development Testing Notebook}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(devtools)
+load_all()
+set.seed(1)
+```
+
+"The data-set contains a matrix of 574 individuals and 1,001 variables. These variables are real-world genotypes centered and scaled, and therefore retains the correlation structure of variables in the original genotype data. 3 out of the variables have non-zero effects. The response data is generated under a multivariate linear regression model. See Wang et al (2020) for more details."
+
+```{r Get data}
+data("SuSiE_N3_X") #This comes from the SuSiE pkg under 'data/'N3finemapping.rData'
+# data(N3finemapping)
+# 
+# SuSiE_N3_X = N3finemapping$X
+```
+
+SuSiER simulated the response without showing the source code. Here is my take using their sparse sim code.
+
+```{r Simualate y}
+set.seed(1)
+
+#Get n, p from X data
+X = as.matrix(SuSiE_N3_X)[,1:100]
+n = dim(X)[1]
+p = dim(X)[2]
+
+#Choose L
+L = 6
+
+sigma = 2 #make sure this doesn't dominate our dataset
+# in the future, we will want to calc. the variance of Xb, then set
+# the residual variance to be a small proportion of the systemic variance
+
+
+#TODO: 
+#Set the "true" params
+beta = rep(0,p)
+beta[1:5] = seq(-10,10, length.out = 5)
+
+## SIMULATION: Turn into fcns
+y = X %*% beta + rnorm(n, mean = 0, sd = sigma)
+
+```
+
+```{r Initialize arguments}
+
+#Set prior params -- arbitrary for now
+mu_0 = matrix(0,nrow = L, ncol = 1) 
+sigma_0_2 = matrix(.1,nrow = L, ncol = 1) 
+prior_inclusion_weights = matrix(1/p,nrow = 1,ncol = p)
+# prior_inclusion_weights = matrix(c(1,rep(0,9)),nrow = 1,ncol = p)
+
+```
+
+```{r setup}
+library(devtools)
+# library(susieR)
+library(matrixStats)
+library(susieR)
+load_all()
+```
+ 
+```{r}
+undebug(susie)
+
+#Fit susie to the raw data
+susie_output <- susie(
+    X,
+    y,
+    L
+    )
+susie_output$elbo
+susie_output$pip
+
+#Fit susine to the raw data
+susine_output <- susine(
+    L,
+    X,
+    y,
+    prior_update_method = "var"
+    )
+susine_output$model_fit$PIPs
+susine_output$model_fit$sigma_2
+susine_output$model_fit$elbo
+
+XtX = t(X)%*%X
+Xty = t(X)%*%y
+yty = sum(y^2)
+
+#Fit susie_ss to the summary stats
+susie_output <- susie_suff_stat(XtX, Xty, yty, n)
+susie_output$elbo
+susie_output$pip
+
+#Fit susine_ss to the summary stats
+susine_output <- susine_ss(
+    L,
+    XtX,
+    Xty,
+    yty,
+    n=nrow(X),
+    prior_update_method = "var"
+    )
+
+susine_output$model_fit$PIPs
+susine_output$model_fit$sigma_2
+susine_output$model_fit$elbo
+
+
+#Using unstandardized z scores
+sumstats <- univariate_regression(X, y)
+z_scores <- sumstats$betahat / sumstats$sebetahat
+R <- cor(X)
+n=nrow(X)
+
+susie_output  <- susie_rss(bhat = sumstats$betahat, 
+                           shat = sumstats$sebetahat, 
+                           n = n,
+                           R = R, 
+                           var_y = drop(var(y)),
+                           L = 6,
+                           estimate_residual_variance = TRUE)
+susie_output$elbo
+susie_output$pip
+
+susine_output <- susine_rss(
+    L,
+    z_scores,
+    R,
+    n=n,
+    s_hat = sumstats$sebetahat,
+    var_y = drop(var(y)),
+    prior_update_method = "var"
+    )
+susine_output$model_fit$PIPs
+susine_output$model_fit$sigma_2
+susine_output$model_fit$elbo
+
+#Using standardized z scores -- ???
+undebug(susie_rss)
+susie_output  <- susie_rss(z = z_scores,
+                           n = n,
+                           R = R, 
+                           L = 6,
+                           estimate_residual_variance = TRUE)
+susie_output$elbo
+susie_output$sigma2
+
+round(susie_output$pip,2)
+
+undebug(susine_rss)
+susine_output <- susine_rss(
+    L,
+    z_scores,
+    R,
+    n=n,
+    prior_update_method = "var"
+    )
+susine_output$model_fit$PIPs
+susine_output$model_fit$sigma_2
+susine_output$model_fit$elbo
+
+```

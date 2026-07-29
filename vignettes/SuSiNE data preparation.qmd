@@ -1,0 +1,72 @@
+---
+title: "SuSiNE_data_prep"
+format: html
+editor: visual
+---
+
+## 1/9/25 – Generating Genotype + Annotations for SuSiNE
+
+```{r}
+library(knitr)
+library(dplyr)
+```
+
+```{r}
+gene = 'CBX8'
+tissue = 'Lung'
+```
+
+#### Loading the Annotations file
+
+-   Load file
+-   Filter by tissue
+-   Extract BP position, chromosome
+
+```{r}
+setwd("/path/to/project")
+folder_path = "/path/to/project/Other data/GTEx QTL Annotations/" #Edit
+file_name = paste0(gene,".csv")
+df_file_path <- file.path(folder_path,file_name)
+
+annots <- read.csv(df_file_path, header = TRUE, stringsAsFactors = FALSE)
+
+annots <- annots %>%
+  filter(Tissue == tissue) %>%
+  mutate(Pos.BP = as.numeric(sub(".*_(\\d+)_.*", "\\1", `Variant.Id`))) %>%
+  mutate(Chromosome = sub("(_.*)", "", `Variant.Id`))
+
+chromosomes_of_interest = 'chr17'
+if (length(chromosomes_of_interest) > 1) {print("Warning: annotations span multiple chromosomes")}
+```
+
+#### Loading the Genotype BIM file
+
+```{r}
+folder_path = "/path/to/project/Other data/Simulated Genotypes" #Edit
+file_name = paste0("EUR_",chromosomes_of_interest,".bim")
+df_file_path <- file.path(folder_path,file_name)
+
+SNPs <- read.table(df_file_path, header = FALSE, stringsAsFactors = FALSE)
+
+colnames(SNPs) = c('Chromosome', 'Var_ID', 'Pos.Morgans','Pos.BP', 'Allele.1','Allele.2')
+
+SNPs$rsID <- sub(":.*", "", SNPs$Var_ID)
+```
+
+How many SNPs do we have in the default GTEx eQTL window?
+
+```{r}
+window = c(min(annots$Pos.BP), max(annots$Pos.BP))
+
+# Get rsIDs of SNPs where Pos.BP in QTL window
+genotype_var_ids <- SNPs$rsID[SNPs$Pos.BP >= window[1] & SNPs$Pos.BP <= window[2]]
+
+common_SNPs = intersect(genotype_var_ids, annots$SNP.Id)
+common_SNPs = intersect(SNPs$rsID, annots$SNP.Id)
+setdiff(common_SNPs, genotype_var_ids)
+setdiff(genotype_var_ids, common_SNPs)
+intersect(genotype_var_ids, common_SNPs)
+
+```
+
+How wide does the window need to be to select 1,000 SNPs?

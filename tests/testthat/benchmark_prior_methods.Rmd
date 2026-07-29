@@ -1,0 +1,610 @@
+---
+title: "SuSiNE Prior Update Methods Benchmark"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+## User Parameters
+
+Edit this chunk to change the benchmark grid. Re-knit to re-run.
+The fitting cache is automatically invalidated when any parameter here changes.
+
+```{r params, echo=TRUE}
+# ============================================================
+# USER PARAMETERS
+# ============================================================
+p_star_grid        <- c(1, 3, 10)    # numbers of causal SNPs to simulate
+annotation_r2_grid <- c(0.2, 0.8)   # annotation quality: r2(a[causal], beta[causal])
+noise_grid         <- c(0.5, 0.8)   # noise fraction: proportion of total variance = noise
+n_seeds            <- 3              # seeds per grid cell (increase for replication)
+L                  <- 10              # number of single effects
+max_iter           <- 50             # max IBSS iterations per fit
+inflate_match      <- 1              # non-causal annotation noise (0 = zeros, 1 = matched variance)
+
+# Degeneracy thresholds (Section D)
+c_degen_low    <- 0.1    # c < this (and c < 0) is degenerate (signal suppressed/flipped)
+c_degen_high   <- 10.0   # c > this is degenerate (signal exploded)
+sig_degen_low  <- 0.01   # sigma_0_2 < this is degenerate (collapsed)
+sig_degen_high <- 1.0    # sigma_0_2 > this is degenerate (inflated)
+
+methods <- c(
+  "none", "none_annotated", "var", "scale_var", "scale"
+)
+# ============================================================
+```
+
+```{r derived-params, echo=FALSE}
+total_runs <- length(c("N3", "KLK11", "AMT")) *
+              length(p_star_grid) * length(annotation_r2_grid) *
+              length(noise_grid) * n_seeds
+cat(sprintf("Grid: 3 X sources x %d p* x %d r2 x %d noise x %d seeds = **%d runs/method** (%d total fits)\n",
+            length(p_star_grid), length(annotation_r2_grid),
+            length(noise_grid), n_seeds,
+            total_runs, total_runs * length(methods)))
+```
+
+---
+
+## Setup & Data Loading
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# When knitting from RStudio, the working directory is already the Rmd's directory.
+# This block handles edge cases (e.g., rendering from another directory).
+local({
+  rmd_path <- tryCatch(normalizePath(knitr::current_input()), error = function(e) NULL)
+  if (!is.null(rmd_path) && nzchar(rmd_path)) setwd(dirname(rmd_path))
+})
+
+suppressPackageStartupMessages(devtools::load_all("../../", quiet = TRUE))
+
+# --- SuSiE N3 (standard benchmark, ~574 x 1001) ---
+n3_path <- "../../../test_susine/data/SuSiE_N3_X.rda"
+if (!file.exists(n3_path)) stop("SuSiE_N3_X.rda not found: ", n3_path)
+load(n3_path)  # loads SuSiE_N3_X
+
+# --- Real M1-stratified genotype matrices (scenario_1, n=600, ~1000 SNPs) ---
+data_root <- "../../../test_susine/data/sampled_simulated_genotypes/scenario_1/"
+
+load_tsv_gz <- function(path) {
+  if (!file.exists(path)) stop("Not found: ", path)
+  mat <- readr::read_tsv(path,
+    col_types      = readr::cols(.default = "d", participant_ID = "c"),
+    show_col_types = FALSE, progress = FALSE)
+  m <- as.matrix(mat[, -1])
+  storage.mode(m) <- "double"
+  m
+}
+
+X_low_m1 <- load_tsv_gz(paste0(
+  data_root, "KLK11_ENST00000453757_3_chr19_bp51529870_closest1000_n600.tsv.gz"))
+X_high_m1 <- load_tsv_gz(paste0(
+  data_root, "AMT_ENST00000495436_1_chr3_bp49459884_closest1000_n600.tsv.gz"))
+
+x_list <- list(
+  N3    = as.matrix(SuSiE_N3_X),
+  KLK11 = X_low_m1,
+  AMT   = X_high_m1
+)
+x_meta <- data.frame(
+  x_source = c("N3", "KLK11", "AMT"),
+  label    = c("N3 (standard, n=574)", "KLK11 (M1=0.084, n=600)", "AMT (M1=0.229, n=600)"),
+  M1       = c(NA, 0.084, 0.229)
+)
+
+cat(sprintf("  %-8s  %d x %d\n", "N3",    nrow(SuSiE_N3_X),  ncol(SuSiE_N3_X)))
+cat(sprintf("  %-8s  %d x %d  (M1 = 0.084)\n", "KLK11", nrow(X_low_m1),  ncol(X_low_m1)))
+cat(sprintf("  %-8s  %d x %d  (M1 = 0.229)\n", "AMT",   nrow(X_high_m1), ncol(X_high_m1)))
+```
+
+---
+
+## Simulation Helpers
+
+```{r helpers}
+# Annotation vector matching test_susine::simulate_priors() behaviour.
+# Causal SNPs: a = beta + noise  (targeting annotation_r2 on causal indices).
+# Non-causal SNPs: white noise with variance matched to causal annotation variance
+# (controlled by inflate_match; 0 = zeros, 1 = matched variance).
+make_annotation <- function(beta, annotation_r2, inflate_match = 1, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  causal <- which(beta != 0)
+  p <- length(beta)
+  a <- rep(0, p)
+  if (length(causal) == 0 || annotation_r2 <= 0) return(a)
+
+  b_c  <- beta[causal]
+  b_sd <- if (length(b_c) > 1) sd(b_c) else abs(b_c)
+  if (b_sd == 0) b_sd <- 1
+
+  # Causal: annotation = true beta + noise (targeting annotation_r2)
+  noise_sd <- b_sd * sqrt((1 - annotation_r2) / annotation_r2)
+  a[causal] <- b_c + rnorm(length(b_c), 0, noise_sd)
+
+  # Non-causal: white noise with variance matched to causal annotation variance
+  if (inflate_match > 0) {
+    causal_var <- var(a[causal])
+    if (is.na(causal_var) || causal_var == 0) causal_var <- noise_sd^2
+    noncausal_idx <- setdiff(seq_len(p), causal)
+    a[noncausal_idx] <- rnorm(length(noncausal_idx), 0, sqrt(inflate_match * causal_var))
+  }
+  a
+}
+
+# Phenotype: noise_fraction = proportion of total variance that is noise.
+make_phenotype <- function(X, beta, noise_fraction, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  Xb         <- drop(X %*% beta)
+  signal_var <- mean(Xb^2)
+  sigma2 <- if (signal_var == 0 || noise_fraction >= 1) 1
+            else signal_var * noise_fraction / (1 - noise_fraction)
+  y <- Xb + rnorm(nrow(X), 0, sqrt(sigma2))
+  y - mean(y)
+}
+
+# AUPRC via trapezoidal integration
+compute_auprc <- function(pips, is_causal) {
+  ord          <- order(pips, decreasing = TRUE)
+  truth_sorted <- is_causal[ord]
+  tp           <- cumsum(truth_sorted)
+  fp           <- cumsum(!truth_sorted)
+  precision    <- tp / (tp + fp)
+  recall       <- tp / max(sum(is_causal), 1L)
+  n_pts        <- length(recall)
+  if (n_pts < 2) return(NA_real_)
+  sum(diff(recall) * (precision[-1] + precision[-n_pts]) / 2)
+}
+```
+
+---
+
+## Fitting Loop
+
+This chunk is cached. Re-knit with unchanged parameters reuses the cache.
+Change any parameter above to invalidate the cache and re-run.
+
+```{r fitting-loop, cache=TRUE, cache.extra=list(p_star_grid, annotation_r2_grid, noise_grid, n_seeds, L, methods, max_iter, inflate_match), message=FALSE, warning=FALSE}
+run_results <- data.frame(
+  run_id = integer(), x_source = character(), p_star = integer(),
+  annotation_r2 = numeric(), noise = numeric(), seed = integer(),
+  method = character(), auprc = numeric(), final_elbo = numeric(),
+  n_iter = integer(), error = character(), stringsAsFactors = FALSE)
+
+effect_results <- data.frame(
+  run_id = integer(), x_source = character(), p_star = integer(),
+  annotation_r2 = numeric(), noise = numeric(), seed = integer(),
+  method = character(), effect = integer(),
+  c_l = numeric(), sigma_0_2_l = numeric(), mu_eff_l = numeric(),
+  stringsAsFactors = FALSE)
+
+run_id <- 0
+fit_count <- 0
+total_fits <- total_runs * length(methods)
+cat(sprintf("Running %d total fits ...\n", total_fits))
+
+for (x_name in names(x_list)) {
+  X_full <- x_list[[x_name]]
+  p_full <- ncol(X_full)
+  for (p_star in p_star_grid) {
+    for (r2 in annotation_r2_grid) {
+      for (noise_frac in noise_grid) {
+        for (s in seq_len(n_seeds)) {
+          run_id    <- run_id + 1
+          base_seed <- run_id * 17 + s
+
+          set.seed(base_seed)
+          causal       <- sample(p_full, min(p_star, p_full))
+          beta         <- rep(0, p_full)
+          beta[causal] <- rnorm(p_star, 0, 0.8)
+          is_causal    <- (beta != 0)
+          y <- make_phenotype(X_full, beta, noise_frac, seed = base_seed + 1)
+          a <- make_annotation(beta, r2, inflate_match = inflate_match,
+                               seed = base_seed + 2)
+
+          for (m in methods) {
+            # Dispatch: determine mu_0 and actual prior_update_method
+            if (m == "none") {
+              mu_0_input <- NULL
+              fit_method <- "none"
+            } else if (m == "none_annotated") {
+              mu_0_input <- a
+              fit_method <- "none"
+            } else if (m == "var") {
+              mu_0_input <- NULL
+              fit_method <- m
+            } else {
+              mu_0_input <- a
+              fit_method <- m
+            }
+
+            fit_count <- fit_count + 1
+            if (fit_count %% 20 == 0 || fit_count == 1 || fit_count == total_fits) {
+              cat(sprintf("  Fit %d / %d (%.0f%%) — %s / %s / p*=%d / r2=%.1f / noise=%.1f / seed=%d\n",
+                          fit_count, total_fits, 100 * fit_count / total_fits,
+                          m, x_name, p_star, r2, noise_frac, s))
+            }
+
+            # Suppress susine's convergence prints while preserving errors
+            fit <- tryCatch({
+              invisible(capture.output(
+                .res <- susine(L = L, X = X_full, y = y,
+                               mu_0 = mu_0_input, sigma_0_2 = 0.2,
+                               prior_update_method = fit_method,
+                               max_iter = max_iter, tol = 1e-4),
+                type = "output"))
+              .res
+            }, error = function(e) list(error = conditionMessage(e)))
+
+            if (!is.null(fit$error)) {
+              run_results <- rbind(run_results, data.frame(
+                run_id = run_id, x_source = x_name, p_star = p_star,
+                annotation_r2 = r2, noise = noise_frac, seed = s, method = m,
+                auprc = NA, final_elbo = NA, n_iter = NA,
+                error = fit$error, stringsAsFactors = FALSE))
+            } else {
+              run_results <- rbind(run_results, data.frame(
+                run_id = run_id, x_source = x_name, p_star = p_star,
+                annotation_r2 = r2, noise = noise_frac, seed = s, method = m,
+                auprc      = compute_auprc(fit$model_fit$PIPs, is_causal),
+                final_elbo = tail(fit$model_fit$elbo, 1),
+                n_iter     = length(fit$model_fit$elbo) - 1L,
+                error = "", stringsAsFactors = FALSE))
+
+              alpha_mat <- fit$effect_fits$alpha
+              b_hat_mat <- fit$effect_fits$b_hat
+              sigma_mat <- fit$priors$sigma_0_2
+              c_vec     <- fit$priors$mu_0_scale_factor
+
+              for (l in seq_len(L)) {
+                effect_results <- rbind(effect_results, data.frame(
+                  run_id = run_id, x_source = x_name, p_star = p_star,
+                  annotation_r2 = r2, noise = noise_frac, seed = s,
+                  method = m, effect = l,
+                  c_l         = if (!is.null(c_vec) && length(c_vec) >= l) c_vec[l] else 1,
+                  sigma_0_2_l = sigma_mat[l, 1],
+                  mu_eff_l    = sum(b_hat_mat[l, ]),
+                  stringsAsFactors = FALSE))
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+cat(sprintf("\nDone. %d fits completed, %d errors.\n", sum(run_results$error == ""), sum(run_results$error != "")))
+
+# Derived columns used throughout
+ok  <- run_results %>% dplyr::filter(error == "")
+err <- run_results %>% dplyr::filter(error != "")
+
+# Method ordering by overall mean AUPRC (descending) — used in all plots
+method_order <- ok %>%
+  dplyr::group_by(method) %>%
+  dplyr::summarise(mean_auprc = mean(auprc, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(mean_auprc) %>%
+  dplyr::pull(method)
+
+ok <- ok %>%
+  dplyr::mutate(method = factor(method, levels = method_order))
+effect_results <- effect_results %>%
+  dplyr::mutate(method = factor(method, levels = method_order))
+```
+
+---
+
+## Section A: Overall AUPRC
+
+```{r sec-a-table}
+sec_a <- ok %>%
+  dplyr::group_by(method) %>%
+  dplyr::summarise(
+    n        = dplyr::n(),
+    AUPRC    = round(mean(auprc,      na.rm = TRUE), 3),
+    SD       = round(sd(auprc,        na.rm = TRUE), 3),
+    ELBO     = round(mean(final_elbo, na.rm = TRUE), 1),
+    Iter     = round(mean(n_iter,     na.rm = TRUE), 1),
+    .groups  = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(AUPRC))
+
+knitr::kable(sec_a, caption = "Overall AUPRC per method (all runs)", align = "lrrrrrr")
+```
+
+```{r sec-a-plot, fig.width=8, fig.height=5}
+ggplot(ok, aes(x = method, y = auprc, fill = method)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.4, size = 1.5) +
+  coord_flip() +
+  scale_fill_manual(values = scales::hue_pal()(length(methods)), guide = "none") +
+  labs(title = "AUPRC distribution per method (all runs)",
+       x = NULL, y = "AUPRC") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+---
+
+## Section B: AUPRC by Scenario
+
+```{r sec-b-helpers, echo=FALSE}
+heatmap_auprc <- function(data, x_col, x_lab) {
+  hm <- data %>%
+    dplyr::group_by(method, .data[[x_col]]) %>%
+    dplyr::summarise(mean_auprc = mean(auprc, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(x_val = factor(.data[[x_col]]))
+
+  ggplot(hm, aes(x = x_val, y = method, fill = mean_auprc)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.3f", mean_auprc)), size = 3.2) +
+    scale_fill_viridis_c(option = "plasma", limits = c(0, NA), name = "Mean\nAUPRC") +
+    labs(x = x_lab, y = NULL,
+         title = paste("Mean AUPRC by method x", x_lab)) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          panel.grid = element_blank())
+}
+
+axis_table <- function(data, x_col) {
+  data %>%
+    dplyr::group_by(method, .data[[x_col]]) %>%
+    dplyr::summarise(mean_auprc = round(mean(auprc, na.rm = TRUE), 3), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = dplyr::all_of(x_col), values_from = mean_auprc) %>%
+    dplyr::arrange(dplyr::desc(dplyr::pick(dplyr::last_col())))
+}
+```
+
+### By Number of Causal SNPs (p\*)
+
+```{r sec-b-pstar-table}
+knitr::kable(axis_table(ok, "p_star"),
+             caption = "Mean AUPRC by method x p*", digits = 3)
+```
+
+```{r sec-b-pstar-plot, fig.width=7, fig.height=5}
+heatmap_auprc(ok, "p_star", "p* (causal SNPs)")
+```
+
+### By Annotation Quality
+
+```{r sec-b-r2-table}
+knitr::kable(axis_table(ok, "annotation_r2"),
+             caption = "Mean AUPRC by method x annotation_r2", digits = 3)
+```
+
+```{r sec-b-r2-plot, fig.width=6.5, fig.height=5}
+heatmap_auprc(ok, "annotation_r2", "annotation r2")
+```
+
+### By Noise Fraction
+
+```{r sec-b-noise-table}
+knitr::kable(axis_table(ok, "noise"),
+             caption = "Mean AUPRC by method x noise fraction", digits = 3)
+```
+
+```{r sec-b-noise-plot, fig.width=6.5, fig.height=5}
+heatmap_auprc(ok, "noise", "noise fraction")
+```
+
+### By X Source (LD Structure)
+
+```{r sec-b-xsource-table}
+knitr::kable(axis_table(ok, "x_source"),
+             caption = "Mean AUPRC by method x genotype matrix", digits = 3)
+```
+
+```{r sec-b-xsource-plot, fig.width=7, fig.height=5}
+heatmap_auprc(ok, "x_source", "X source")
+```
+
+---
+
+## Section C: Per-Effect Parameter Distributions
+
+### Summary Table
+
+```{r sec-c-table}
+sec_c <- effect_results %>%
+  dplyr::group_by(method) %>%
+  dplyr::summarise(
+    N          = dplyr::n(),
+    c_mean     = round(mean(c_l,             na.rm = TRUE), 3),
+    c_sd       = round(sd(c_l,               na.rm = TRUE), 3),
+    sig_mean   = round(mean(sigma_0_2_l,     na.rm = TRUE), 4),
+    sig_sd     = round(sd(sigma_0_2_l,       na.rm = TRUE), 4),
+    mu_eff_mean = round(mean(abs(mu_eff_l),  na.rm = TRUE), 4),
+    mu_eff_sd  = round(sd(abs(mu_eff_l),     na.rm = TRUE), 4),
+    .groups    = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(dplyr::row_number()))  # keep method_order
+
+knitr::kable(sec_c,
+             col.names = c("Method", "N effects", "c mean", "c SD",
+                           "σ₀² mean", "σ₀² SD", "|μ_eff| mean", "|μ_eff| SD"),
+             caption = "Per-effect parameter distributions (all runs × L effects)")
+```
+
+### Distribution of c per Method (raw scale, sign preserved)
+
+Vertical lines: black = 0, red dashed = degeneracy thresholds (`r c_degen_low` and `r c_degen_high`).
+
+```{r sec-c-c-hist-raw, fig.width=11, fig.height=8, warning=FALSE}
+ggplot(effect_results, aes(x = c_l, fill = method)) +
+  geom_histogram(bins = 40, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "black", linewidth = 0.6) +
+  geom_vline(xintercept = c_degen_low,  linetype = "dashed", color = "red",    linewidth = 0.7) +
+  geom_vline(xintercept = c_degen_high, linetype = "dashed", color = "darkred", linewidth = 0.7) +
+  facet_wrap(~ method, scales = "free", ncol = 3) +
+  scale_fill_manual(values = scales::hue_pal()(length(methods)), guide = "none") +
+  labs(title = "Distribution of c per method (raw scale, sign preserved)",
+       subtitle = paste0("Black = 0, red dashed = degeneracy thresholds c = ",
+                         c_degen_low, " and ", c_degen_high),
+       x = "c (scale factor)", y = "Count") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+### Distribution of log|c| per Method (supplementary)
+
+```{r sec-c-c-hist-log, fig.width=11, fig.height=8, warning=FALSE}
+ef_plot <- effect_results %>%
+  dplyr::mutate(log10_abs_c = log10(abs(c_l) + 1e-6))
+
+ggplot(ef_plot, aes(x = log10_abs_c, fill = method)) +
+  geom_histogram(bins = 35, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = log10(c_degen_low),  linetype = "dashed", color = "red",    linewidth = 0.7) +
+  geom_vline(xintercept = log10(c_degen_high), linetype = "dashed", color = "darkred", linewidth = 0.7) +
+  facet_wrap(~ method, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = scales::hue_pal()(length(methods)), guide = "none") +
+  labs(title = "Distribution of log10|c| per method (supplementary)",
+       subtitle = paste0("Red dashed lines: degeneracy thresholds |c| = ",
+                         c_degen_low, " and ", c_degen_high),
+       x = "log10(|c|)", y = "Count") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+### Distribution of log(σ₀²) per Method
+
+```{r sec-c-sigma-hist, fig.width=11, fig.height=8, warning=FALSE}
+ef_plot2 <- effect_results %>%
+  dplyr::mutate(log10_sigma = log10(sigma_0_2_l + 1e-8))
+
+ggplot(ef_plot2, aes(x = log10_sigma, fill = method)) +
+  geom_histogram(bins = 35, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = log10(sig_degen_low  + 1e-8), linetype = "dashed", color = "darkorange", linewidth = 0.7) +
+  geom_vline(xintercept = log10(sig_degen_high),        linetype = "dashed", color = "red",        linewidth = 0.7) +
+  facet_wrap(~ method, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = scales::hue_pal()(length(methods)), guide = "none") +
+  labs(title = "Distribution of log10(σ₀²) per method",
+       subtitle = paste0("Dashed lines: thresholds σ₀² = ",
+                         sig_degen_low, " (orange) and ", sig_degen_high, " (red)"),
+       x = "log10(σ₀²)", y = "Count") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+### σ₀² by p\* per Method
+
+```{r sec-c-sigma-pstar, fig.width=11, fig.height=8, warning=FALSE}
+ggplot(effect_results,
+       aes(x = factor(p_star), y = sigma_0_2_l, fill = factor(p_star))) +
+  geom_boxplot(outlier.size = 0.8, alpha = 0.75) +
+  facet_wrap(~ method, scales = "free_y", ncol = 3) +
+  scale_fill_brewer(palette = "Pastel1", name = "p*") +
+  labs(title = "σ₀² distribution by p* per method",
+       x = "p* (causal SNPs)", y = "σ₀²") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+---
+
+## Section D: Degeneracy Frequencies
+
+Degeneracy thresholds (from parameters above):
+
+- **c negative**: c < 0 (annotation direction flipped — degenerate)
+- **c too small**: 0 ≤ c < `r c_degen_low` (signal suppressed)
+- **c too large**: c > `r c_degen_high` (signal exploded)
+- **σ₀² degenerate**: σ₀² < `r sig_degen_low` or σ₀² > `r sig_degen_high`
+
+```{r sec-d-compute, echo=FALSE}
+effect_results <- effect_results %>%
+  dplyr::mutate(
+    c_neg     = c_l < 0,
+    c_small   = c_l >= 0 & c_l < c_degen_low,
+    c_large   = c_l > c_degen_high,
+    c_degen   = c_neg | c_small | c_large,
+    sig_degen = sigma_0_2_l < sig_degen_low | sigma_0_2_l > sig_degen_high,
+    any_degen = c_degen | sig_degen
+  )
+```
+
+### Degeneracy Table
+
+```{r sec-d-table}
+degen_tbl <- effect_results %>%
+  dplyr::group_by(method) %>%
+  dplyr::summarise(
+    n_effects       = dplyr::n(),
+    pct_c_neg       = round(100 * mean(c_neg,     na.rm = TRUE), 1),
+    pct_c_small     = round(100 * mean(c_small,   na.rm = TRUE), 1),
+    pct_c_large     = round(100 * mean(c_large,   na.rm = TRUE), 1),
+    pct_c_degen     = round(100 * mean(c_degen,   na.rm = TRUE), 1),
+    pct_sig_degen   = round(100 * mean(sig_degen, na.rm = TRUE), 1),
+    pct_either      = round(100 * mean(any_degen, na.rm = TRUE), 1),
+    .groups         = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(pct_either))
+
+knitr::kable(degen_tbl,
+             col.names = c("Method", "N effects", "% c<0", "% c too small",
+                           "% c too large", "% c any degen",
+                           "% σ₀² degen", "% either degen"),
+             caption = paste0("Degeneracy frequencies  |  ",
+                              "c thresholds: negative / [0,", c_degen_low, ") / (",
+                              c_degen_high, ",∞)  |  ",
+                              "σ₀² thresholds: [", sig_degen_low, ", ", sig_degen_high, "]"))
+```
+
+### Degeneracy Frequency Plot
+
+```{r sec-d-plot, fig.width=9, fig.height=6}
+degen_long <- degen_tbl %>%
+  dplyr::select(method, pct_c_neg, pct_c_small, pct_c_large, pct_sig_degen) %>%
+  tidyr::pivot_longer(
+    cols      = c(pct_c_neg, pct_c_small, pct_c_large, pct_sig_degen),
+    names_to  = "degen_type",
+    values_to = "pct"
+  ) %>%
+  dplyr::mutate(
+    degen_type = dplyr::recode(degen_type,
+      pct_c_neg     = "c < 0 (sign flip)",
+      pct_c_small   = paste0("0 ≤ c < ", c_degen_low, " (suppressed)"),
+      pct_c_large   = paste0("c > ", c_degen_high, " (exploded)"),
+      pct_sig_degen = paste0("σ₀² outside [", sig_degen_low, ", ", sig_degen_high, "]")
+    ),
+    degen_type = factor(degen_type, levels = c(
+      "c < 0 (sign flip)",
+      paste0("0 ≤ c < ", c_degen_low, " (suppressed)"),
+      paste0("c > ", c_degen_high, " (exploded)"),
+      paste0("σ₀² outside [", sig_degen_low, ", ", sig_degen_high, "]")
+    )),
+    method = factor(method, levels = method_order)
+  )
+
+ggplot(degen_long, aes(x = method, y = pct, fill = degen_type)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  coord_flip() +
+  scale_fill_manual(values = c("steelblue", "gold3", "firebrick", "darkorange"),
+                    name = "Degeneracy type") +
+  labs(title = "Fraction of effects with degenerate c or σ₀²",
+       x = NULL, y = "% of effects") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank())
+```
+
+---
+
+## Section E: Errors
+
+```{r sec-e}
+if (nrow(err) == 0) {
+  cat("No errors in any of the", total_runs * length(methods), "fits.\n")
+} else {
+  cat(sprintf("%d error(s):\n", nrow(err)))
+  knitr::kable(err %>% dplyr::select(run_id, x_source, p_star, annotation_r2, noise, method, error),
+               caption = "Errored fits")
+}
+```
