@@ -1,5 +1,6 @@
 ^susine\.Rproj$
 ^\.Rproj\.user$
+^\.zenodo\.json$
 ^LICENSE\.md$
 ^README\.Rmd$
 ^data-raw$
